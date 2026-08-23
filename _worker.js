@@ -64,6 +64,29 @@ async function puedeEnTienda(botId, usuario, env) {
 }
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Llave de la mudanza (ruta /migrar). NO está en este archivo ni en el repo:
+ * vive en la tabla `_config` de la base del sitio, que solo puede escribir
+ * quien tiene el token del panel. Si no existe, /migrar queda apagada.
+ */
+async function llaveMudanza(env) {
+  if (!env.DB) return null;
+  try {
+    const r = await env.DB.prepare("SELECT valor FROM _config WHERE clave = 'llave_mudanza'").first();
+    return r && r.valor ? String(r.valor) : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Compara sin filtrar información por el tiempo que tarda. */
+function igualSeguro(a, b) {
+  if (typeof a !== "string" || typeof b !== "string" || a.length !== b.length) return false;
+  let d = 0;
+  for (let i = 0; i < a.length; i++) d |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return d === 0;
+}
 /** Solo letras, números, guiones, puntos y barras. Nada de "..". */
 const claveSegura = (c) => !!c && !c.includes("..") && /^[A-Za-z0-9/_.-]{3,200}$/.test(c);
 
@@ -125,6 +148,50 @@ export default {
       });
 
       return json({ ok: true, clave, url: `${url.origin}/media/${clave}`, bytes: archivo.size }, 201);
+    }
+
+    // ---- Mudanza de imágenes viejas (uso interno, una sola vez) ----
+    //
+    // Trae una imagen que hoy vive en Supabase y la guarda aquí. No la sube el
+    // cliente: la descarga el servidor de la URL pública que ya existe. Se
+    // autoriza con la llave de mudanza, que vive en la base y no en el código.
+    if (url.pathname === "/migrar" && request.method === "POST") {
+      if (!env.BUCKET) return json({ error: "almacenamiento_no_disponible" }, 503);
+      const llave = await llaveMudanza(env);
+      if (!llave) return json({ error: "mudanza_apagada" }, 403);
+      const dada = (request.headers.get("x-llave-mudanza") || "").trim();
+      if (!igualSeguro(dada, llave)) return json({ error: "llave_invalida" }, 401);
+
+      let cuerpo;
+      try {
+        cuerpo = await request.json();
+      } catch {
+        return json({ error: "peticion_invalida" }, 400);
+      }
+      const origen = String(cuerpo.origen || "");
+      const botId = String(cuerpo.bot_id || "");
+      const carpeta = String(cuerpo.carpeta || "productos");
+      if (!UUID.test(botId)) return json({ error: "bot_id_invalido" }, 400);
+      if (!/^[a-z0-9-]{2,40}$/.test(carpeta)) return json({ error: "carpeta_invalida" }, 400);
+      // Solo se trae de nuestro propio Supabase: nadie puede usar esto para
+      // que el servidor descargue de cualquier sitio de Internet.
+      if (!origen.startsWith(SUPABASE_URL + "/storage/")) return json({ error: "origen_no_permitido" }, 400);
+
+      const res = await fetch(origen);
+      if (!res.ok) return json({ error: "origen_no_responde", status: res.status }, 502);
+      const tipo = res.headers.get("content-type") || "image/jpeg";
+      if (!TIPOS_PERMITIDOS.has(tipo.split(";")[0].trim())) return json({ error: "tipo_no_permitido", tipo }, 415);
+
+      const datos = await res.arrayBuffer();
+      if (datos.byteLength > MAX_BYTES) return json({ error: "archivo_muy_grande" }, 413);
+      const ext = (tipo.split("/")[1] || "jpg").split(";")[0].replace("jpeg", "jpg");
+      const clave = `${botId}/${carpeta}/mudanza-${Date.now()}-${crypto.randomUUID().slice(0, 8)}.${ext}`;
+
+      await env.BUCKET.put(clave, datos, {
+        httpMetadata: { contentType: tipo, cacheControl: "public, max-age=31536000, immutable" },
+        customMetadata: { bot_id: botId, mudado_de: origen, mudado_en: new Date().toISOString() },
+      });
+      return json({ ok: true, clave, url: `${url.origin}/media/${clave}`, bytes: datos.byteLength }, 201);
     }
 
     // ---- Lectura y borrado ----
