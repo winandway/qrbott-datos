@@ -1,18 +1,77 @@
 /**
- * QRbott — servicio de datos en YaDominios Cloud (PASO 1 de MIGRACION.md).
+ * QRbott — servicio de datos en YaDominios Cloud (PASO 2 de MIGRACION.md).
  *
- * Este repositorio es público a propósito (YaDominios solo publica repos
- * públicos). Por eso aquí NO hay nada del panel, ni claves, ni lógica de
- * negocio: es solo la puerta de entrada a la base (env.DB) y a los archivos
- * (env.BUCKET) del sitio `qrbott`. Todo lo demás vive en el repo privado.
+ * Este repositorio es PÚBLICO a propósito (la plataforma solo publica repos
+ * públicos). Por eso aquí no hay ni una clave secreta, ni el panel, ni lógica
+ * de negocio: es la puerta a la base (env.DB) y al almacenamiento (env.BUCKET).
  *
- * Rutas (sin /api/: en YaDominios ese prefijo choca con los estáticos):
- *   GET /datos/salud  → estado de la base y del almacenamiento (canario)
- *   GET /media/<clave> → devuelve un archivo del bucket (PASO 2, imágenes)
+ * Rutas (sin /api/: ese prefijo choca con los estáticos en esta plataforma):
+ *   GET  /datos/salud    → canario: estado de la base y del almacenamiento
+ *   POST /upload         → sube una imagen al almacenamiento (requiere sesión)
+ *   GET  /media/<clave>  → devuelve el archivo
+ *   DELETE /media/<clave>→ borra el archivo (requiere sesión y ser de esa tienda)
+ *
+ * SEGURIDAD DE LA SUBIDA (importante, porque este archivo se lee público):
+ * no hay ninguna llave escondida. Quien sube manda su propia sesión de QRbott
+ * en `Authorization: Bearer <token>`; el worker le pregunta a Supabase si esa
+ * sesión es válida y si esa persona tiene acceso a esa tienda (RPC
+ * `has_bot_access`, que ya respeta los permisos). Si no, 401/403 y no se
+ * escribe nada. La clave anónima que se usa para preguntar es pública: es la
+ * misma que ya viaja en el navegador de cualquier visitante.
  */
+
+const SUPABASE_URL = "https://ekurbldypbygxfwbghik.supabase.co";
+// Clave ANÓNIMA (pública). No da acceso a nada por sí sola: todo pasa por RLS.
+const SUPABASE_ANON =
+  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImVrdXJibGR5cGJ5Z3hmd2JnaGlrIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTIwMDkyNDAsImV4cCI6MjA2NzU4NTI0MH0.rmrL9Z6FgqDCgsBJ6z2o87QoSZTVlt2M1wtoablvQDI";
+
+const TIPOS_PERMITIDOS = new Set(["image/webp", "image/jpeg", "image/png", "image/gif", "application/pdf"]);
+const MAX_BYTES = 10 * 1024 * 1024; // 10 MB por archivo
+
+const cors = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
+  "Access-Control-Allow-Headers": "Authorization, Content-Type",
+  "Access-Control-Max-Age": "86400",
+};
+
+const json = (cuerpo, status = 200) =>
+  Response.json(cuerpo, { status, headers: { ...cors, "Cache-Control": "no-store" } });
+
+/** Pregunta a Supabase quién es el dueño de esta sesión. null si no vale. */
+async function usuarioDe(request, env) {
+  const auth = request.headers.get("authorization") || "";
+  if (!auth.toLowerCase().startsWith("bearer ")) return null;
+  const anon = env.SUPABASE_ANON_KEY || SUPABASE_ANON;
+  const r = await fetch(`${SUPABASE_URL}/auth/v1/user`, {
+    headers: { apikey: anon, Authorization: auth },
+  });
+  if (!r.ok) return null;
+  const u = await r.json();
+  return u && u.id ? { id: u.id, token: auth } : null;
+}
+
+/** ¿Esta persona puede tocar esta tienda? Lo decide la base, no nosotros. */
+async function puedeEnTienda(botId, usuario, env) {
+  const anon = env.SUPABASE_ANON_KEY || SUPABASE_ANON;
+  const r = await fetch(`${SUPABASE_URL}/rest/v1/rpc/has_bot_access`, {
+    method: "POST",
+    headers: { apikey: anon, Authorization: usuario.token, "Content-Type": "application/json" },
+    body: JSON.stringify({ p_bot_id: botId }),
+  });
+  if (!r.ok) return false;
+  return (await r.json()) === true;
+}
+
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+/** Solo letras, números, guiones, puntos y barras. Nada de "..". */
+const claveSegura = (c) => !!c && !c.includes("..") && /^[A-Za-z0-9/_.-]{3,200}$/.test(c);
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
+
+    if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: cors });
 
     if (url.pathname === "/datos/salud") {
       let db = "sin binding";
@@ -26,23 +85,70 @@ export default {
       }
       const bucket = env.BUCKET ? "ok" : "sin binding";
       const estado = db === "ok" && bucket === "ok" ? "ok" : "degradado";
-      return Response.json(
+      return json(
         { servicio: "qrbott-datos", estado, db, bucket, hora: new Date().toISOString() },
-        { status: estado === "ok" ? 200 : 503, headers: { "Cache-Control": "no-store" } }
+        estado === "ok" ? 200 : 503
       );
     }
 
+    // ---- Subida ----
+    if (url.pathname === "/upload" && request.method === "POST") {
+      if (!env.BUCKET) return json({ error: "almacenamiento_no_disponible" }, 503);
+
+      const usuario = await usuarioDe(request, env);
+      if (!usuario) return json({ error: "sesion_invalida" }, 401);
+
+      let form;
+      try {
+        form = await request.formData();
+      } catch {
+        return json({ error: "peticion_invalida" }, 400);
+      }
+      const archivo = form.get("archivo");
+      const botId = String(form.get("bot_id") || "");
+      const carpeta = String(form.get("carpeta") || "productos");
+
+      if (!UUID.test(botId)) return json({ error: "bot_id_invalido" }, 400);
+      if (!(archivo instanceof File)) return json({ error: "falta_archivo" }, 400);
+      if (!TIPOS_PERMITIDOS.has(archivo.type)) return json({ error: "tipo_no_permitido", tipo: archivo.type }, 415);
+      if (archivo.size > MAX_BYTES) return json({ error: "archivo_muy_grande", max_mb: 10 }, 413);
+      if (!/^[a-z0-9-]{2,40}$/.test(carpeta)) return json({ error: "carpeta_invalida" }, 400);
+
+      if (!(await puedeEnTienda(botId, usuario, env))) return json({ error: "sin_acceso_a_la_tienda" }, 403);
+
+      const ext = (archivo.type.split("/")[1] || "bin").replace("jpeg", "jpg");
+      const clave = `${botId}/${carpeta}/${Date.now()}-${crypto.randomUUID().slice(0, 8)}.${ext}`;
+
+      await env.BUCKET.put(clave, archivo.stream(), {
+        httpMetadata: { contentType: archivo.type, cacheControl: "public, max-age=31536000, immutable" },
+        customMetadata: { bot_id: botId, subido_por: usuario.id, subido_en: new Date().toISOString() },
+      });
+
+      return json({ ok: true, clave, url: `${url.origin}/media/${clave}`, bytes: archivo.size }, 201);
+    }
+
+    // ---- Lectura y borrado ----
     if (url.pathname.startsWith("/media/")) {
-      if (!env.BUCKET) return new Response("Almacenamiento no disponible", { status: 503 });
       const clave = decodeURIComponent(url.pathname.slice("/media/".length));
-      if (!clave || clave.includes("..")) return new Response("No encontrado", { status: 404 });
+      if (!claveSegura(clave)) return new Response("No encontrado", { status: 404, headers: cors });
+
+      if (request.method === "DELETE") {
+        const usuario = await usuarioDe(request, env);
+        if (!usuario) return json({ error: "sesion_invalida" }, 401);
+        const botId = clave.split("/")[0];
+        if (!UUID.test(botId)) return json({ error: "clave_invalida" }, 400);
+        if (!(await puedeEnTienda(botId, usuario, env))) return json({ error: "sin_acceso_a_la_tienda" }, 403);
+        await env.BUCKET.delete(clave);
+        return json({ ok: true, borrado: clave });
+      }
+
+      if (!env.BUCKET) return new Response("Almacenamiento no disponible", { status: 503, headers: cors });
       const obj = await env.BUCKET.get(clave);
-      if (!obj) return new Response("No encontrado", { status: 404 });
-      const h = new Headers();
+      if (!obj) return new Response("No encontrado", { status: 404, headers: cors });
+      const h = new Headers(cors);
       obj.writeHttpMetadata(h);
       h.set("etag", obj.httpEtag);
       h.set("Cache-Control", "public, max-age=31536000, immutable");
-      h.set("Access-Control-Allow-Origin", "*");
       return new Response(obj.body, { headers: h });
     }
 
