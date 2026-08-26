@@ -20,6 +20,9 @@
  * misma que ya viaja en el navegador de cualquier visitante.
  */
 
+import { entrar, registrar, cambiarClave, leerSesion, buscarPorCorreo } from "./cuentas.js";
+import { consultar, insertar, actualizar, borrar, tiendasDe } from "./acceso.js";
+
 const SUPABASE_URL = "https://ekurbldypbygxfwbghik.supabase.co";
 // Clave ANÓNIMA (pública). No da acceso a nada por sí sola: todo pasa por RLS.
 const SUPABASE_ANON =
@@ -148,6 +151,100 @@ export default {
       });
 
       return json({ ok: true, clave, url: `${url.origin}/media/${clave}`, bytes: archivo.size }, 201);
+    }
+
+    // ---- Cuentas propias ----
+    //
+    // Entrar, registrarse y cambiar la contraseña sin pasar por Supabase. La
+    // primera vez que alguien entra, su cuenta se muda sola (ver cuentas.js).
+    if (url.pathname.startsWith("/cuentas/")) {
+      if (!env.DB) return json({ error: "base_no_disponible" }, 503);
+      const accion = url.pathname.slice("/cuentas/".length);
+
+      if (accion === "yo") {
+        const yo = await leerSesion(env.DB, (request.headers.get("authorization") || "").replace(/^Bearer /i, ""));
+        if (!yo) return json({ error: "sesion_invalida" }, 401);
+        const tiendas = await tiendasDe(env.DB, yo.id);
+        return json({ ok: true, usuario: yo, tiendas });
+      }
+
+      if (request.method !== "POST") return json({ error: "metodo_no_permitido" }, 405);
+      let cuerpo;
+      try {
+        cuerpo = await request.json();
+      } catch {
+        return json({ error: "peticion_invalida" }, 400);
+      }
+
+      try {
+        if (accion === "entrar") {
+          const r = await entrar(env.DB, { ...env, SUPABASE_URL, SUPABASE_ANON_KEY: env.SUPABASE_ANON_KEY || SUPABASE_ANON }, cuerpo.correo, cuerpo.clave);
+          return json({
+            ok: true,
+            vale: r.vale,
+            usuario: { id: r.usuario.id, correo: r.usuario.correo, nombre: r.usuario.nombre ?? null },
+            mudado: r.mudado,
+            tiendas: await tiendasDe(env.DB, r.usuario.id),
+          });
+        }
+        if (accion === "registro") {
+          const r = await registrar(env.DB, cuerpo.correo, cuerpo.clave, cuerpo.nombre);
+          return json(
+            { ok: true, vale: r.vale, usuario: { id: r.usuario.id, correo: r.usuario.correo, nombre: r.usuario.nombre } },
+            201,
+          );
+        }
+        if (accion === "cambiar-clave") {
+          const yo = await leerSesion(env.DB, (request.headers.get("authorization") || "").replace(/^Bearer /i, ""));
+          if (!yo) return json({ error: "sesion_invalida" }, 401);
+          await cambiarClave(env.DB, yo.id, cuerpo.actual, cuerpo.nueva);
+          return json({ ok: true });
+        }
+      } catch (e) {
+        const m = e?.message || "error";
+        // Nunca se dice si el fallo fue el correo o la contraseña: eso le
+        // regalaría a quien prueba claves la mitad de la respuesta.
+        const codigo = m === "credenciales_invalidas" || m === "cuenta_desactivada" ? 401 : 400;
+        return json({ error: m }, codigo);
+      }
+      return json({ error: "accion_desconocida" }, 404);
+    }
+
+    // ---- Datos, siempre con el filtro de tienda ----
+    if (url.pathname === "/datos/consulta" && request.method === "POST") {
+      if (!env.DB) return json({ error: "base_no_disponible" }, 503);
+      const yo = await leerSesion(env.DB, (request.headers.get("authorization") || "").replace(/^Bearer /i, ""));
+      if (!yo) return json({ error: "sesion_invalida" }, 401);
+
+      let c;
+      try {
+        c = await request.json();
+      } catch {
+        return json({ error: "peticion_invalida" }, 400);
+      }
+
+      // Escribir exige poder editar; leer, solo tener acceso.
+      const soloEditables = c.operacion && c.operacion !== "leer";
+      const tiendas = await tiendasDe(env.DB, yo.id, soloEditables);
+
+      try {
+        switch (c.operacion || "leer") {
+          case "leer":
+            return json({ ok: true, filas: await consultar(env.DB, tiendas, c) });
+          case "insertar":
+            return json({ ok: true, ...(await insertar(env.DB, tiendas, c.tabla, c.datos)) }, 201);
+          case "actualizar":
+            return json({ ok: true, ...(await actualizar(env.DB, tiendas, c.tabla, c.id, c.cambios)) });
+          case "borrar":
+            return json({ ok: true, ...(await borrar(env.DB, tiendas, c.tabla, c.id)) });
+          default:
+            return json({ error: "operacion_desconocida" }, 400);
+        }
+      } catch (e) {
+        const m = e?.message || "error";
+        const codigo = /sin_acceso|no_existe_o_sin_acceso|sin_tiendas/.test(m) ? 403 : 400;
+        return json({ error: m }, codigo);
+      }
     }
 
     // ---- Mudanza de imágenes viejas (uso interno, una sola vez) ----

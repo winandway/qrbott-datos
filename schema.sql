@@ -484,3 +484,26 @@ CREATE TABLE IF NOT EXISTS _config (
   valor TEXT NOT NULL,
   actualizado_en TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+-- ---------- Cuentas propias ----------
+--
+-- Reemplaza al sistema de cuentas de Supabase. El `id` es el MISMO que tenía
+-- allá a propósito: los accesos (`_acceso`) y los datos ya apuntan a ese id, y
+-- cambiarlo obligaría a reescribir todo.
+--
+-- `clave_cifrada` guarda "pbkdf2$vueltas$sal$resumen". Nunca la contraseña.
+-- `origen` dice si la cuenta nació aquí ('propio') o se mudó ('supabase'):
+-- sirve para saber cuánta gente queda por mudar y cuándo se puede cortar
+-- la última atadura.
+CREATE TABLE IF NOT EXISTS usuarios (
+  id TEXT PRIMARY KEY,
+  correo TEXT NOT NULL UNIQUE,
+  clave_cifrada TEXT NOT NULL,
+  nombre TEXT,
+  origen TEXT NOT NULL DEFAULT 'propio',
+  activo INTEGER NOT NULL DEFAULT 1,
+  ultimo_acceso TEXT,
+  creado_en TEXT NOT NULL DEFAULT (datetime('now')),
+  actualizado_en TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS usuarios_correo_idx ON usuarios (correo);
