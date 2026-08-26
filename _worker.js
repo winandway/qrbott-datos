@@ -1,7 +1,7 @@
 // GENERADO por construir.mjs — no editar a mano. El código está en src/.
 
 // src/cuentas.js
-var VUELTAS = 21e4;
+var VUELTAS = 1e5;
 var HORAS_SESION = 12;
 var utf8 = (s) => new TextEncoder().encode(s);
 var b64url = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");

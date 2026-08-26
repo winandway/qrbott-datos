@@ -28,7 +28,19 @@
  * archivo: el repositorio es público.
  */
 
-const VUELTAS = 210_000;
+/**
+ * Vueltas del cifrado. **100.000 es el TOPE de la plataforma**: Cloudflare
+ * Workers rechaza más ("iteration counts above 100000 are not supported"),
+ * comprobado en vivo el 26-08-2026.
+ *
+ * OWASP recomienda más para PBKDF2-SHA256, así que aquí se está en el máximo
+ * que se puede, no en el ideal. Lo que compensa: cada persona tiene su propia
+ * sal (una tabla precalculada no sirve de nada) y las contraseñas nunca se
+ * guardan en claro. Si algún día la plataforma sube el tope, o llega bcrypt
+ * nativo, se sube este número: las contraseñas viejas siguen funcionando
+ * porque cada una guarda con cuántas vueltas se hizo.
+ */
+const VUELTAS = 100_000;
 const HORAS_SESION = 12;
 
 const utf8 = (s) => new TextEncoder().encode(s);
