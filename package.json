@@ -20,5 +20,8 @@
   "homepage": "https://github.com/winandway/qrbott-datos#readme",
   "devDependencies": {
     "esbuild": "^0.28.2"
+  },
+  "dependencies": {
+    "playwright-core": "^1.62.1"
   }
 }
