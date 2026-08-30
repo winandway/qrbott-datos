@@ -10,7 +10,7 @@
  *
  * No toca la base de verdad: usa una SQLite en memoria con la misma forma.
  */
-import { consultar, insertar, actualizar, borrar, tiendasDe, TABLAS } from '../acceso.js';
+import { consultar, insertar, actualizar, borrar, tiendasDe, TABLAS } from '../src/acceso.js';
 
 const fallos = [];
 const comprobar = (ok, que) => {
