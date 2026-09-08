@@ -59,7 +59,10 @@ CREATE TABLE IF NOT EXISTS bots (
   mercatren_connected INTEGER NOT NULL DEFAULT 0,
   mercatren_store_slug TEXT,
   mercatren_sync_activa INTEGER NOT NULL DEFAULT 1,
-  modo_tienda TEXT NOT NULL DEFAULT 'completa'
+  modo_tienda TEXT NOT NULL DEFAULT 'completa',
+  showbot_legacy INTEGER NOT NULL DEFAULT 0,
+  pos_exige_caja INTEGER NOT NULL DEFAULT 1,
+  archived_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS sucursales (
@@ -72,7 +75,8 @@ CREATE TABLE IF NOT EXISTS sucursales (
   activa INTEGER NOT NULL DEFAULT 1,
   es_principal INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
-  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  es_deposito INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS sucursales_bot_idx ON sucursales (bot_id);
 
@@ -110,7 +114,13 @@ CREATE TABLE IF NOT EXISTS bot_knowledge_base (
   sucursal_id TEXT,
   product_barcode TEXT,
   sync_origin TEXT,
-  mercatren_synced_at TEXT
+  mercatren_synced_at TEXT,
+  product_cost REAL,
+  product_images TEXT,
+  stock_min REAL,
+  archived_at TEXT,
+  papelera_desde TEXT,
+  papelera_por TEXT
 );
 CREATE INDEX IF NOT EXISTS bot_knowledge_base_bot_idx ON bot_knowledge_base (bot_id);
 
@@ -213,7 +223,9 @@ CREATE TABLE IF NOT EXISTS bot_collaborators (
   status TEXT NOT NULL DEFAULT 'active',
   invited_by TEXT NOT NULL,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
-  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  permisos TEXT NOT NULL DEFAULT '{}',
+  comision_pct REAL NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS bot_collaborators_bot_idx ON bot_collaborators (bot_id);
 
@@ -231,7 +243,8 @@ CREATE TABLE IF NOT EXISTS pos_customers (
   purchases_count INTEGER NOT NULL DEFAULT 0,
   total_spent REAL NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
-  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  archived_at TEXT
 );
 CREATE INDEX IF NOT EXISTS pos_customers_bot_idx ON pos_customers (bot_id);
 
@@ -346,7 +359,8 @@ CREATE TABLE IF NOT EXISTS client_requests (
   shipping_address TEXT,
   customer_id TEXT,
   customer_email TEXT,
-  terms_accepted_at TEXT
+  terms_accepted_at TEXT,
+  stock_descontado INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS client_requests_bot_idx ON client_requests (bot_id);
 
@@ -388,7 +402,8 @@ CREATE TABLE IF NOT EXISTS pos_sales (
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   sucursal_id TEXT,
   client_ref TEXT,
-  sold_offline_at TEXT
+  sold_offline_at TEXT,
+  extemporanea INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS pos_sales_bot_idx ON pos_sales (bot_id);
 
@@ -427,6 +442,18 @@ CREATE TABLE IF NOT EXISTS pos_shipments (
   sucursal_id TEXT
 );
 CREATE INDEX IF NOT EXISTS pos_shipments_bot_idx ON pos_shipments (bot_id);
+
+CREATE TABLE IF NOT EXISTS pos_stock_faltantes (
+  id TEXT PRIMARY KEY,
+  bot_id TEXT NOT NULL,
+  sale_id TEXT,
+  producto_id TEXT,
+  producto TEXT,
+  pedido REAL NOT NULL,
+  habia REAL NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS pos_stock_faltantes_bot_idx ON pos_stock_faltantes (bot_id);
 
 CREATE TABLE IF NOT EXISTS pos_devices (
   id TEXT PRIMARY KEY,
@@ -468,42 +495,3 @@ CREATE TABLE IF NOT EXISTS _acceso (
   PRIMARY KEY (user_id, bot_id)
 );
 CREATE INDEX IF NOT EXISTS _acceso_user_idx ON _acceso (user_id);
-
--- ---------- Interno del servicio ----------
-CREATE TABLE IF NOT EXISTS _salud (
-  id INTEGER PRIMARY KEY CHECK (id = 1),
-  actualizado_en TEXT NOT NULL DEFAULT (datetime('now'))
-);
-INSERT OR IGNORE INTO _salud (id) VALUES (1);
-
--- Ajustes internos (la llave de la mudanza de imágenes). Se escribe desde el
--- panel con el token del sitio, nunca desde el código: por eso el repositorio
--- puede ser público sin exponer nada.
-CREATE TABLE IF NOT EXISTS _config (
-  clave TEXT PRIMARY KEY,
-  valor TEXT NOT NULL,
-  actualizado_en TEXT NOT NULL DEFAULT (datetime('now'))
-);
-
--- ---------- Cuentas propias ----------
---
--- Reemplaza al sistema de cuentas de Supabase. El `id` es el MISMO que tenía
--- allá a propósito: los accesos (`_acceso`) y los datos ya apuntan a ese id, y
--- cambiarlo obligaría a reescribir todo.
---
--- `clave_cifrada` guarda "pbkdf2$vueltas$sal$resumen". Nunca la contraseña.
--- `origen` dice si la cuenta nació aquí ('propio') o se mudó ('supabase'):
--- sirve para saber cuánta gente queda por mudar y cuándo se puede cortar
--- la última atadura.
-CREATE TABLE IF NOT EXISTS usuarios (
-  id TEXT PRIMARY KEY,
-  correo TEXT NOT NULL UNIQUE,
-  clave_cifrada TEXT NOT NULL,
-  nombre TEXT,
-  origen TEXT NOT NULL DEFAULT 'propio',
-  activo INTEGER NOT NULL DEFAULT 1,
-  ultimo_acceso TEXT,
-  creado_en TEXT NOT NULL DEFAULT (datetime('now')),
-  actualizado_en TEXT NOT NULL DEFAULT (datetime('now'))
-);
-CREATE INDEX IF NOT EXISTS usuarios_correo_idx ON usuarios (correo);
