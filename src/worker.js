@@ -21,6 +21,7 @@
  */
 
 import { entrar, registrar, cambiarClave, leerSesion, buscarPorCorreo } from "./cuentas.js";
+import { espejar, desdeLaUltima, CADA_MS } from "./espejo.js";
 import { consultar, insertar, actualizar, borrar, tiendasDe } from "./acceso.js";
 
 const SUPABASE_URL = "https://ekurbldypbygxfwbghik.supabase.co";
@@ -94,10 +95,31 @@ function igualSeguro(a, b) {
 const claveSegura = (c) => !!c && !c.includes("..") && /^[A-Za-z0-9/_.-]{3,200}$/.test(c);
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
     if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: cors });
+
+    // EL ESPEJO. Copia las tablas de Supabase a esta base. No tiene reloj propio:
+    // se aprovecha del Vigilante de YaDominios, que pide la portada cada 5 minutos
+    // para comprobar que el sitio responde. Esa visita —o cualquier otra— lo
+    // dispara si la última copia ya tiene más de 5 minutos. El trabajo va en
+    // segundo plano (`waitUntil`): quien pidió la página no espera por él.
+    if (url.pathname === "/espejo/correr" && request.method === "POST") {
+      const llave = await llaveMudanza(env);
+      if (!llave || (request.headers.get("authorization") || "") !== `Bearer ${llave}`) {
+        return json({ error: "no_autorizado" }, 401);
+      }
+      return json(await espejar(env));
+    }
+    if (url.pathname === "/espejo/estado") {
+      if (!env.DB) return json({ error: "base_no_disponible" }, 503);
+      const { results } = await env.DB.prepare("SELECT hora, familia, ok, filas, segundos, detalle FROM _espejo ORDER BY hora DESC LIMIT 10").all();
+      return json({ ultimas: results || [] });
+    }
+    if (env.DB && ctx && (await desdeLaUltima(env.DB)) > CADA_MS) {
+      ctx.waitUntil(espejar(env).catch(() => null));
+    }
 
     if (url.pathname === "/datos/salud") {
       let db = "sin binding";

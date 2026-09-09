@@ -165,6 +165,152 @@ async function cambiarClave(db, userId, claveActual, claveNueva) {
   return { ok: true };
 }
 
+// src/espejo.js
+var FAMILIAS = {
+  catalogo: ["bots", "sucursales", "bot_knowledge_base", "bot_combos", "bot_banners", "bot_coupons", "bot_payment_methods", "bot_collaborators"],
+  clientes: ["pos_customers", "bot_customers"],
+  documentos: ["documentos_comerciales", "documento_lineas", "documento_contadores", "bot_datos_emisor"],
+  pedidos: ["client_requests"],
+  pos: ["pos_registers", "pos_sales", "pos_cash_movements", "pos_shipments", "pos_devices", "pos_deletions"]
+};
+var CLAVE = { bot_datos_emisor: ["bot_id"], documento_contadores: ["bot_id", "tipo"] };
+var claveDe = (t) => CLAVE[t] || ["id"];
+var HEREDA = {
+  documento_lineas: { padre: "documentos_comerciales", clave: "documento_id" },
+  pos_cash_movements: { padre: "pos_registers", clave: "register_id" }
+};
+var TOPE_SENTENCIA = 8e4;
+var PAGINA = 1e3;
+var CADA_MS = 5 * 60 * 1e3;
+function literal(v) {
+  if (v === null || v === void 0) return "NULL";
+  if (typeof v === "number") return Number.isFinite(v) ? String(v) : "NULL";
+  if (typeof v === "boolean") return v ? "1" : "0";
+  const s = (typeof v === "object" ? JSON.stringify(v) : String(v)).split(String.fromCharCode(0)).join("").split("'").join("''");
+  return `'${s}'`;
+}
+var SUPABASE_URL = "https://ekurbldypbygxfwbghik.supabase.co";
+async function leerDeSupabase(env, clave, tabla, columnas = "*") {
+  const filas = [];
+  for (let desde = 0; ; desde += PAGINA) {
+    const r = await fetch(`${env.SUPABASE_URL || SUPABASE_URL}/rest/v1/${tabla}?select=${columnas}`, {
+      headers: { apikey: clave, Authorization: `Bearer ${clave}`, Range: `${desde}-${desde + PAGINA - 1}`, "Range-Unit": "items" }
+    });
+    if (!r.ok) throw new Error(`supabase ${tabla} ${r.status}`);
+    const tanda = await r.json();
+    filas.push(...tanda);
+    if (tanda.length < PAGINA) return filas;
+  }
+}
+function sentenciasDeInsercion(tabla, columnas, filas) {
+  const cabeza = `INSERT OR REPLACE INTO ${tabla} (${columnas.join(", ")}) VALUES `;
+  const salida = [];
+  let grupo = [];
+  let bytes = cabeza.length;
+  for (const f of filas) {
+    const v = `(${columnas.map((c) => literal(f[c])).join(", ")})`;
+    if (bytes + v.length + 2 > TOPE_SENTENCIA && grupo.length) {
+      salida.push(cabeza + grupo.join(","));
+      grupo = [];
+      bytes = cabeza.length;
+    }
+    grupo.push(v);
+    bytes += v.length + 1;
+  }
+  if (grupo.length) salida.push(cabeza + grupo.join(","));
+  return salida;
+}
+async function columnasDeTodas(db) {
+  const { results } = await db.prepare("SELECT name, sql FROM sqlite_master WHERE type = 'table'").all();
+  const mapa = {};
+  for (const f of results || []) {
+    const txt = String(f.sql || "");
+    mapa[f.name] = txt.slice(txt.indexOf("(") + 1, txt.lastIndexOf(")")).split("\n").map((l) => l.trim()).filter((l) => l && !/^(PRIMARY|UNIQUE|FOREIGN|CHECK|CONSTRAINT)\b/i.test(l)).map((l) => l.split(/[\s(]/)[0].replace(/["`[\],]/g, "")).filter(Boolean);
+  }
+  return mapa;
+}
+async function espejarTabla(env, clave, db, tabla, cols, padres) {
+  if (!cols?.length) return { tabla, saltada: true };
+  const filas = await leerDeSupabase(env, clave, tabla);
+  const h = HEREDA[tabla];
+  const vivas = [];
+  let sinTienda = 0;
+  for (const fila of filas) {
+    if (h) {
+      fila.bot_id = padres[h.padre]?.get(fila[h.clave]) ?? null;
+      if (!fila.bot_id) {
+        sinTienda++;
+        continue;
+      }
+    }
+    vivas.push(fila);
+  }
+  const usadas = cols.filter((c) => vivas.some((f) => c in f));
+  if (vivas.length) {
+    const stmts = sentenciasDeInsercion(tabla, usadas, vivas).map((s) => db.prepare(s));
+    for (let i = 0; i < stmts.length; i += 10) await db.batch(stmts.slice(i, i + 10));
+  }
+  const k = claveDe(tabla);
+  const comoTexto = (f) => JSON.stringify(k.map((c) => String(f[c] ?? "")));
+  const all\u00E1 = new Set(vivas.map(comoTexto));
+  const { results: aqu\u00ED } = await db.prepare(`SELECT ${k.join(", ")} FROM ${tabla}`).all();
+  const sobran = (aqu\u00ED || []).filter((f) => !all\u00E1.has(comoTexto(f)));
+  if (sobran.length) {
+    const trozos = [];
+    for (let i = 0; i < sobran.length; i += 200) trozos.push(sobran.slice(i, i + 200));
+    await db.batch(
+      trozos.map(
+        (t) => db.prepare(`DELETE FROM ${tabla} WHERE ${t.map((f) => `(${k.map((c) => `${c} = ${literal(f[c])}`).join(" AND ")})`).join(" OR ")}`)
+      )
+    );
+  }
+  const destino = (aqu\u00ED || []).length - sobran.length;
+  return { tabla, origen: filas.length, destino, esperadas: vivas.length, sinTienda, borradas: sobran.length, ok: destino === vivas.length, filasLeidas: filas };
+}
+async function espejar(env) {
+  const t0 = Date.now();
+  const db = env.DB;
+  const clave = (await db.prepare("SELECT valor FROM _config WHERE clave = 'clave_supabase'").first())?.valor;
+  if (!clave) return { ok: false, filas: 0, tablas: 0, segundos: 0, hora: (/* @__PURE__ */ new Date()).toISOString(), problemas: ["falta clave_supabase en _config"] };
+  await db.prepare("CREATE TABLE IF NOT EXISTS _espejo (hora TEXT PRIMARY KEY, familia TEXT, ok INTEGER, filas INTEGER, segundos INTEGER, detalle TEXT)").run();
+  const columnas = await columnasDeTodas(db);
+  const padres = {};
+  const resumen = [];
+  for (const tablas of Object.values(FAMILIAS)) {
+    for (const t of tablas) {
+      try {
+        const r = await espejarTabla(env, clave, db, t, columnas[t], padres);
+        resumen.push(r);
+        if (t === "documentos_comerciales" || t === "pos_registers") {
+          padres[t] = new Map((r.filasLeidas || []).map((f) => [f.id, f.bot_id]));
+        }
+      } catch (e) {
+        resumen.push({ tabla: t, ok: false, error: String(e).slice(0, 200) });
+      }
+    }
+  }
+  const mal = resumen.filter((r) => !r.ok && !r.saltada);
+  const estado = {
+    hora: (/* @__PURE__ */ new Date()).toISOString(),
+    familia: "todas",
+    segundos: Math.round((Date.now() - t0) / 1e3),
+    filas: resumen.reduce((a, r) => a + (r.destino || 0), 0),
+    tablas: resumen.length,
+    ok: mal.length === 0,
+    problemas: mal.map((m) => `${m.tabla}: ${m.error ?? `${m.esperadas}\u2192${m.destino}`}`)
+  };
+  await db.prepare("INSERT OR REPLACE INTO _espejo (hora, familia, ok, filas, segundos, detalle) VALUES (?, ?, ?, ?, ?, ?)").bind(estado.hora, estado.familia, estado.ok ? 1 : 0, estado.filas, estado.segundos, JSON.stringify(estado.problemas)).run();
+  return estado;
+}
+async function desdeLaUltima(db) {
+  try {
+    const r = await db.prepare("SELECT hora FROM _espejo ORDER BY hora DESC LIMIT 1").first();
+    return r?.hora ? Date.now() - Date.parse(r.hora) : Infinity;
+  } catch {
+    return Infinity;
+  }
+}
+
 // src/acceso.js
 var TABLAS = /* @__PURE__ */ new Map([
   ["bots", "id"],
@@ -284,7 +430,7 @@ async function borrar(db, tiendas, tabla, id) {
 }
 
 // src/worker.js
-var SUPABASE_URL = "https://ekurbldypbygxfwbghik.supabase.co";
+var SUPABASE_URL2 = "https://ekurbldypbygxfwbghik.supabase.co";
 var SUPABASE_ANON = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImVrdXJibGR5cGJ5Z3hmd2JnaGlrIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTIwMDkyNDAsImV4cCI6MjA2NzU4NTI0MH0.rmrL9Z6FgqDCgsBJ6z2o87QoSZTVlt2M1wtoablvQDI";
 var TIPOS_PERMITIDOS = /* @__PURE__ */ new Set(["image/webp", "image/jpeg", "image/png", "image/gif", "application/pdf"]);
 var MAX_BYTES = 10 * 1024 * 1024;
@@ -299,7 +445,7 @@ async function usuarioDe(request, env) {
   const auth = request.headers.get("authorization") || "";
   if (!auth.toLowerCase().startsWith("bearer ")) return null;
   const anon = env.SUPABASE_ANON_KEY || SUPABASE_ANON;
-  const r = await fetch(`${SUPABASE_URL}/auth/v1/user`, {
+  const r = await fetch(`${SUPABASE_URL2}/auth/v1/user`, {
     headers: { apikey: anon, Authorization: auth }
   });
   if (!r.ok) return null;
@@ -308,7 +454,7 @@ async function usuarioDe(request, env) {
 }
 async function puedeEnTienda(botId, usuario, env) {
   const anon = env.SUPABASE_ANON_KEY || SUPABASE_ANON;
-  const r = await fetch(`${SUPABASE_URL}/rest/v1/rpc/has_bot_access`, {
+  const r = await fetch(`${SUPABASE_URL2}/rest/v1/rpc/has_bot_access`, {
     method: "POST",
     headers: { apikey: anon, Authorization: usuario.token, "Content-Type": "application/json" },
     body: JSON.stringify({ p_bot_id: botId })
@@ -334,9 +480,24 @@ function igualSeguro2(a, b) {
 }
 var claveSegura = (c) => !!c && !c.includes("..") && /^[A-Za-z0-9/_.-]{3,200}$/.test(c);
 var worker_default = {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const url = new URL(request.url);
     if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: cors });
+    if (url.pathname === "/espejo/correr" && request.method === "POST") {
+      const llave = await llaveMudanza(env);
+      if (!llave || (request.headers.get("authorization") || "") !== `Bearer ${llave}`) {
+        return json({ error: "no_autorizado" }, 401);
+      }
+      return json(await espejar(env));
+    }
+    if (url.pathname === "/espejo/estado") {
+      if (!env.DB) return json({ error: "base_no_disponible" }, 503);
+      const { results } = await env.DB.prepare("SELECT hora, familia, ok, filas, segundos, detalle FROM _espejo ORDER BY hora DESC LIMIT 10").all();
+      return json({ ultimas: results || [] });
+    }
+    if (env.DB && ctx && await desdeLaUltima(env.DB) > CADA_MS) {
+      ctx.waitUntil(espejar(env).catch(() => null));
+    }
     if (url.pathname === "/datos/salud") {
       let db = "sin binding";
       try {
@@ -398,7 +559,7 @@ var worker_default = {
       if (!TIPOS_PERMITIDOS.has(archivo.type)) return json({ error: "tipo_no_permitido", tipo: archivo.type }, 415);
       if (archivo.size > MAX_BYTES) return json({ error: "archivo_muy_grande", max_mb: 10 }, 413);
       const anon = env.SUPABASE_ANON_KEY || SUPABASE_ANON;
-      const rv = await fetch(`${SUPABASE_URL}/rest/v1/rpc/control_box_validar`, {
+      const rv = await fetch(`${SUPABASE_URL2}/rest/v1/rpc/control_box_validar`, {
         method: "POST",
         headers: { apikey: anon, Authorization: `Bearer ${anon}`, "Content-Type": "application/json" },
         body: JSON.stringify({ p_slug: slug, p_pin: pin })
@@ -438,7 +599,7 @@ var worker_default = {
       }
       try {
         if (accion === "entrar") {
-          const r = await entrar(env.DB, { ...env, SUPABASE_URL, SUPABASE_ANON_KEY: env.SUPABASE_ANON_KEY || SUPABASE_ANON }, cuerpo.correo, cuerpo.clave);
+          const r = await entrar(env.DB, { ...env, SUPABASE_URL: SUPABASE_URL2, SUPABASE_ANON_KEY: env.SUPABASE_ANON_KEY || SUPABASE_ANON }, cuerpo.correo, cuerpo.clave);
           return json({
             ok: true,
             vale: r.vale,
@@ -515,7 +676,7 @@ var worker_default = {
       const carpeta = String(cuerpo.carpeta || "productos");
       if (!UUID.test(botId)) return json({ error: "bot_id_invalido" }, 400);
       if (!/^[a-z0-9-]{2,40}$/.test(carpeta)) return json({ error: "carpeta_invalida" }, 400);
-      if (!origen.startsWith(SUPABASE_URL + "/storage/")) return json({ error: "origen_no_permitido" }, 400);
+      if (!origen.startsWith(SUPABASE_URL2 + "/storage/")) return json({ error: "origen_no_permitido" }, 400);
       const res = await fetch(origen);
       if (!res.ok) return json({ error: "origen_no_responde", status: res.status }, 502);
       const tipo = res.headers.get("content-type") || "image/jpeg";
