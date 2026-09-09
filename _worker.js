@@ -493,10 +493,12 @@ var worker_default = {
     if (url.pathname === "/espejo/estado") {
       if (!env.DB) return json({ error: "base_no_disponible" }, 503);
       const { results } = await env.DB.prepare("SELECT hora, familia, ok, filas, segundos, detalle FROM _espejo ORDER BY hora DESC LIMIT 10").all();
-      return json({ ultimas: results || [] });
+      return json({ trabajoDetras: Boolean(ctx && typeof ctx.waitUntil === "function"), ultimas: results || [] });
     }
-    if (env.DB && ctx && await desdeLaUltima(env.DB) > CADA_MS) {
-      ctx.waitUntil(espejar(env).catch(() => null));
+    if (env.DB && (url.pathname === "/" || url.pathname.startsWith("/espejo/")) && await desdeLaUltima(env.DB) > CADA_MS) {
+      const trabajo = espejar(env).catch(() => null);
+      if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(trabajo);
+      else await trabajo;
     }
     if (url.pathname === "/datos/salud") {
       let db = "sin binding";

@@ -115,10 +115,17 @@ export default {
     if (url.pathname === "/espejo/estado") {
       if (!env.DB) return json({ error: "base_no_disponible" }, 503);
       const { results } = await env.DB.prepare("SELECT hora, familia, ok, filas, segundos, detalle FROM _espejo ORDER BY hora DESC LIMIT 10").all();
-      return json({ ultimas: results || [] });
+      // `trabajoDetras` dice si la plataforma nos pasa `ctx`: sin él, el espejo se
+      // espera en la petición en vez de ir por detrás. Es un dato de diagnóstico.
+      return json({ trabajoDetras: Boolean(ctx && typeof ctx.waitUntil === "function"), ultimas: results || [] });
     }
-    if (env.DB && ctx && (await desdeLaUltima(env.DB)) > CADA_MS) {
-      ctx.waitUntil(espejar(env).catch(() => null));
+    if (env.DB && (url.pathname === "/" || url.pathname.startsWith("/espejo/")) && (await desdeLaUltima(env.DB)) > CADA_MS) {
+      // Si la envoltura de la plataforma pasa `ctx`, el trabajo va detrás y nadie espera.
+      // Si no lo pasa, se espera aquí: son 4 segundos, y el Vigilante corta a los 12.
+      // Solo en la portada (que es lo que él pide) y en las rutas del espejo: una foto
+      // o una tienda jamás pagan este costo.
+      const trabajo = espejar(env).catch(() => null);
+      if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(trabajo); else await trabajo;
     }
 
     if (url.pathname === "/datos/salud") {
