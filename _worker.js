@@ -483,6 +483,11 @@ var worker_default = {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: cors });
+    if (env.DB && await desdeLaUltima(env.DB) > CADA_MS) {
+      const trabajo = espejar(env).catch(() => null);
+      if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(trabajo);
+      else await trabajo;
+    }
     if (url.pathname === "/espejo/correr" && request.method === "POST") {
       const llave = await llaveMudanza(env);
       if (!llave || (request.headers.get("authorization") || "") !== `Bearer ${llave}`) {
@@ -494,11 +499,6 @@ var worker_default = {
       if (!env.DB) return json({ error: "base_no_disponible" }, 503);
       const { results } = await env.DB.prepare("SELECT hora, familia, ok, filas, segundos, detalle FROM _espejo ORDER BY hora DESC LIMIT 10").all();
       return json({ trabajoDetras: Boolean(ctx && typeof ctx.waitUntil === "function"), ultimas: results || [] });
-    }
-    if (env.DB && (url.pathname === "/" || url.pathname.startsWith("/espejo/")) && await desdeLaUltima(env.DB) > CADA_MS) {
-      const trabajo = espejar(env).catch(() => null);
-      if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(trabajo);
-      else await trabajo;
     }
     if (url.pathname === "/datos/salud") {
       let db = "sin binding";

@@ -100,6 +100,15 @@ export default {
 
     if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: cors });
 
+    // EL ESPEJO se dispara aquí, ANTES de cualquier ruta: la portada la sirve la
+    // plataforma sin llegar a las rutas de abajo, y la portada es justo lo que pide
+    // el Vigilante cada 5 minutos. Cuesta una lectura de la base por petición; el
+    // trabajo solo corre si la última copia ya tiene más de 5 minutos.
+    if (env.DB && (await desdeLaUltima(env.DB)) > CADA_MS) {
+      const trabajo = espejar(env).catch(() => null);
+      if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(trabajo); else await trabajo;
+    }
+
     // EL ESPEJO. Copia las tablas de Supabase a esta base. No tiene reloj propio:
     // se aprovecha del Vigilante de YaDominios, que pide la portada cada 5 minutos
     // para comprobar que el sitio responde. Esa visita —o cualquier otra— lo
@@ -118,14 +127,6 @@ export default {
       // `trabajoDetras` dice si la plataforma nos pasa `ctx`: sin él, el espejo se
       // espera en la petición en vez de ir por detrás. Es un dato de diagnóstico.
       return json({ trabajoDetras: Boolean(ctx && typeof ctx.waitUntil === "function"), ultimas: results || [] });
-    }
-    if (env.DB && (url.pathname === "/" || url.pathname.startsWith("/espejo/")) && (await desdeLaUltima(env.DB)) > CADA_MS) {
-      // Si la envoltura de la plataforma pasa `ctx`, el trabajo va detrás y nadie espera.
-      // Si no lo pasa, se espera aquí: son 4 segundos, y el Vigilante corta a los 12.
-      // Solo en la portada (que es lo que él pide) y en las rutas del espejo: una foto
-      // o una tienda jamás pagan este costo.
-      const trabajo = espejar(env).catch(() => null);
-      if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(trabajo); else await trabajo;
     }
 
     if (url.pathname === "/datos/salud") {
