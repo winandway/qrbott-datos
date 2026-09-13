@@ -193,9 +193,14 @@ var SUPABASE_URL = "https://ekurbldypbygxfwbghik.supabase.co";
 async function leerDeSupabase(env, clave, tabla, columnas = "*") {
   const filas = [];
   for (let desde = 0; ; desde += PAGINA) {
-    const r = await fetch(`${env.SUPABASE_URL || SUPABASE_URL}/rest/v1/${tabla}?select=${columnas}`, {
-      headers: { apikey: clave, Authorization: `Bearer ${clave}`, Range: `${desde}-${desde + PAGINA - 1}`, "Range-Unit": "items" }
-    });
+    let r;
+    for (let intento = 1; ; intento++) {
+      r = await fetch(`${env.SUPABASE_URL || SUPABASE_URL}/rest/v1/${tabla}?select=${columnas}`, {
+        headers: { apikey: clave, Authorization: `Bearer ${clave}`, Range: `${desde}-${desde + PAGINA - 1}`, "Range-Unit": "items" }
+      });
+      if (r.ok || r.status < 500 || intento >= 3) break;
+      await new Promise((f) => setTimeout(f, 1500 * intento));
+    }
     if (!r.ok) throw new Error(`supabase ${tabla} ${r.status}`);
     const tanda = await r.json();
     filas.push(...tanda);
