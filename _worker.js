@@ -583,6 +583,38 @@ var worker_default = {
       });
       return json({ ok: true, clave, url: `${url.origin}/media/${clave}`, bytes: archivo.size }, 201);
     }
+    if (url.pathname === "/upload-credito" && request.method === "POST") {
+      if (!env.BUCKET) return json({ error: "almacenamiento_no_disponible" }, 503);
+      let form;
+      try {
+        form = await request.formData();
+      } catch {
+        return json({ error: "peticion_invalida" }, 400);
+      }
+      const archivo = form.get("archivo");
+      const token = String(form.get("token") || "");
+      if (!/^[a-f0-9]{32}$/.test(token)) return json({ error: "enlace_invalido" }, 400);
+      if (!(archivo instanceof File)) return json({ error: "falta_archivo" }, 400);
+      if (!TIPOS_PERMITIDOS.has(archivo.type)) return json({ error: "tipo_no_permitido", tipo: archivo.type }, 415);
+      if (archivo.size > MAX_BYTES) return json({ error: "archivo_muy_grande", max_mb: 10 }, 413);
+      const anon = env.SUPABASE_ANON_KEY || SUPABASE_ANON;
+      const rv = await fetch(`${SUPABASE_URL2}/rest/v1/rpc/pos_credito_publico`, {
+        method: "POST",
+        headers: { apikey: anon, Authorization: `Bearer ${anon}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ p_token: token })
+      });
+      const credito = rv.ok ? await rv.json().catch(() => null) : null;
+      if (!credito || credito.ok !== true) return json({ error: "enlace_no_valido" }, 401);
+      if (credito.estado === "pagado") return json({ error: "credito_ya_pagado" }, 409);
+      const huella = Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(token)))).slice(0, 8).map((b) => b.toString(16).padStart(2, "0")).join("");
+      const ext = (archivo.type.split("/")[1] || "bin").replace("jpeg", "jpg");
+      const clave = `creditos/${huella}/${Date.now()}-${crypto.randomUUID().slice(0, 8)}.${ext}`;
+      await env.BUCKET.put(clave, archivo.stream(), {
+        httpMetadata: { contentType: archivo.type, cacheControl: "public, max-age=31536000, immutable" },
+        customMetadata: { subido_por: "cliente-credito", subido_en: (/* @__PURE__ */ new Date()).toISOString() }
+      });
+      return json({ ok: true, clave, url: `${url.origin}/media/${clave}`, bytes: archivo.size }, 201);
+    }
     if (url.pathname.startsWith("/cuentas/")) {
       if (!env.DB) return json({ error: "base_no_disponible" }, 503);
       const accion = url.pathname.slice("/cuentas/".length);

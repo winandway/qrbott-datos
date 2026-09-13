@@ -321,6 +321,9 @@ CREATE TABLE IF NOT EXISTS documento_contadores (
   ultimo INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS documento_contadores_bot_idx ON documento_contadores (bot_id);
+-- Sin id propio: la fila es una por tienda y tipo. El indice unico es lo que hace
+-- que `INSERT OR REPLACE` reemplace en vez de duplicar (espejo, 8-09-2026).
+CREATE UNIQUE INDEX IF NOT EXISTS documento_contadores_clave ON documento_contadores (bot_id, tipo);
 
 CREATE TABLE IF NOT EXISTS bot_datos_emisor (
   bot_id TEXT NOT NULL,
@@ -337,6 +340,8 @@ CREATE TABLE IF NOT EXISTS bot_datos_emisor (
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
+-- Una ficha de emisor por tienda: el indice unico permite el reemplazo del espejo.
+CREATE UNIQUE INDEX IF NOT EXISTS bot_datos_emisor_clave ON bot_datos_emisor (bot_id);
 CREATE INDEX IF NOT EXISTS bot_datos_emisor_bot_idx ON bot_datos_emisor (bot_id);
 
 -- ---------- Familia: pedidos ----------
