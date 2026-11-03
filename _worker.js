@@ -208,23 +208,37 @@ async function leerDeSupabase(env, clave, tabla, columnas = "*") {
   }
 }
 function sentenciasDeInsercion(tabla, columnas, filas) {
-  const cabeza = `INSERT OR REPLACE INTO ${tabla} (${columnas.join(", ")}) VALUES `;
+  const k = claveDe(tabla);
+  const resto = columnas.filter((c) => !k.includes(c));
+  const cola = resto.length ? ` ON CONFLICT(${k.join(", ")}) DO UPDATE SET ${resto.map((c) => `${c} = excluded.${c}`).join(", ")} WHERE ${resto.map((c) => `${tabla}.${c} IS NOT excluded.${c}`).join(" OR ")}` : ` ON CONFLICT(${k.join(", ")}) DO NOTHING`;
+  const cabeza = `INSERT INTO ${tabla} (${columnas.join(", ")}) VALUES `;
   const salida = [];
   let grupo = [];
-  let bytes = cabeza.length;
+  let bytes = cabeza.length + cola.length;
   for (const f of filas) {
     const v = `(${columnas.map((c) => literal(f[c])).join(", ")})`;
     if (bytes + v.length + 2 > TOPE_SENTENCIA && grupo.length) {
-      salida.push(cabeza + grupo.join(","));
+      salida.push(cabeza + grupo.join(",") + cola);
       grupo = [];
-      bytes = cabeza.length;
+      bytes = cabeza.length + cola.length;
     }
     grupo.push(v);
     bytes += v.length + 1;
   }
-  if (grupo.length) salida.push(cabeza + grupo.join(","));
+  if (grupo.length) salida.push(cabeza + grupo.join(",") + cola);
   return salida;
 }
+function comparable(v) {
+  if (v === null || v === void 0) return null;
+  if (typeof v === "boolean") return v ? "1" : "0";
+  if (typeof v === "object") return JSON.stringify(v);
+  return String(v);
+}
+function cambio(nueva, guardada, columnas) {
+  if (!guardada) return true;
+  return columnas.some((c) => comparable(nueva[c]) !== comparable(guardada[c]));
+}
+var escritasDe = (resultados) => (resultados || []).reduce((a, r) => a + (r?.meta?.rows_written || 0), 0);
 async function columnasDeTodas(db) {
   const { results } = await db.prepare("SELECT name, sql FROM sqlite_master WHERE type = 'table'").all();
   const mapa = {};
@@ -251,30 +265,45 @@ async function espejarTabla(env, clave, db, tabla, cols, padres) {
     vivas.push(fila);
   }
   const usadas = cols.filter((c) => vivas.some((f) => c in f));
-  if (vivas.length) {
-    const stmts = sentenciasDeInsercion(tabla, usadas, vivas).map((s) => db.prepare(s));
-    for (let i = 0; i < stmts.length; i += 10) await db.batch(stmts.slice(i, i + 10));
-  }
   const k = claveDe(tabla);
   const comoTexto = (f) => JSON.stringify(k.map((c) => String(f[c] ?? "")));
+  const { results: antes } = await db.prepare(`SELECT ${usadas.length ? usadas.join(", ") : k.join(", ")} FROM ${tabla}`).all();
+  const guardadas = new Map((antes || []).map((f) => [comoTexto(f), f]));
+  const cambiadas = vivas.filter((f) => cambio(f, guardadas.get(comoTexto(f)), usadas));
+  let escritas = 0;
+  if (cambiadas.length) {
+    const stmts = sentenciasDeInsercion(tabla, usadas, cambiadas).map((s) => db.prepare(s));
+    for (let i = 0; i < stmts.length; i += 10) escritas += escritasDe(await db.batch(stmts.slice(i, i + 10)));
+  }
   const all\u00E1 = new Set(vivas.map(comoTexto));
-  const { results: aqu\u00ED } = await db.prepare(`SELECT ${k.join(", ")} FROM ${tabla}`).all();
-  const sobran = (aqu\u00ED || []).filter((f) => !all\u00E1.has(comoTexto(f)));
+  const sobran = [...guardadas.keys()].filter((c) => !all\u00E1.has(c)).map((c) => guardadas.get(c));
   if (sobran.length) {
     const trozos = [];
     for (let i = 0; i < sobran.length; i += 200) trozos.push(sobran.slice(i, i + 200));
-    await db.batch(
+    escritas += escritasDe(await db.batch(
       trozos.map(
         (t) => db.prepare(`DELETE FROM ${tabla} WHERE ${t.map((f) => `(${k.map((c) => `${c} = ${literal(f[c])}`).join(" AND ")})`).join(" OR ")}`)
       )
-    );
+    ));
   }
-  const destino = (aqu\u00ED || []).length - sobran.length;
-  return { tabla, origen: filas.length, destino, esperadas: vivas.length, sinTienda, borradas: sobran.length, ok: destino === vivas.length, filasLeidas: filas };
+  const nuevas = vivas.filter((f) => !guardadas.has(comoTexto(f))).length;
+  const destino = guardadas.size - sobran.length + nuevas;
+  return { tabla, origen: filas.length, destino, esperadas: vivas.length, sinTienda, borradas: sobran.length, cambiadas: cambiadas.length, escritas, ok: destino === vivas.length, filasLeidas: filas };
 }
-async function espejar(env) {
+async function tomarTurno(db, forzar = false) {
+  await db.prepare("CREATE TABLE IF NOT EXISTS _espejo_turno (id INTEGER PRIMARY KEY, hora INTEGER NOT NULL)").run();
+  const ahora = Date.now();
+  if (forzar) {
+    await db.prepare("INSERT INTO _espejo_turno (id, hora) VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET hora = excluded.hora").bind(ahora).run();
+    return true;
+  }
+  const r = await db.prepare("INSERT INTO _espejo_turno (id, hora) VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET hora = excluded.hora WHERE _espejo_turno.hora <= ?").bind(ahora, ahora - CADA_MS).run();
+  return (r?.meta?.changes ?? r?.meta?.rows_written ?? 0) > 0;
+}
+async function espejar(env, { forzar = false } = {}) {
   const t0 = Date.now();
   const db = env.DB;
+  if (!await tomarTurno(db, forzar)) return { ok: true, saltada: true, motivo: "otra vuelta tiene el turno", hora: (/* @__PURE__ */ new Date()).toISOString() };
   const clave = (await db.prepare("SELECT valor FROM _config WHERE clave = 'clave_supabase'").first())?.valor;
   if (!clave) return { ok: false, filas: 0, tablas: 0, segundos: 0, hora: (/* @__PURE__ */ new Date()).toISOString(), problemas: ["falta clave_supabase en _config"] };
   await db.prepare("CREATE TABLE IF NOT EXISTS _espejo (hora TEXT PRIMARY KEY, familia TEXT, ok INTEGER, filas INTEGER, segundos INTEGER, detalle TEXT)").run();
@@ -300,11 +329,13 @@ async function espejar(env) {
     familia: "todas",
     segundos: Math.round((Date.now() - t0) / 1e3),
     filas: resumen.reduce((a, r) => a + (r.destino || 0), 0),
+    cambiadas: resumen.reduce((a, r) => a + (r.cambiadas || 0), 0),
+    escritas: resumen.reduce((a, r) => a + (r.escritas || 0), 0),
     tablas: resumen.length,
     ok: mal.length === 0,
     problemas: mal.map((m) => `${m.tabla}: ${m.error ?? `${m.esperadas}\u2192${m.destino}`}`)
   };
-  await db.prepare("INSERT OR REPLACE INTO _espejo (hora, familia, ok, filas, segundos, detalle) VALUES (?, ?, ?, ?, ?, ?)").bind(estado.hora, estado.familia, estado.ok ? 1 : 0, estado.filas, estado.segundos, JSON.stringify(estado.problemas)).run();
+  await db.prepare("INSERT OR REPLACE INTO _espejo (hora, familia, ok, filas, segundos, detalle) VALUES (?, ?, ?, ?, ?, ?)").bind(estado.hora, estado.familia, estado.ok ? 1 : 0, estado.filas, estado.segundos, JSON.stringify({ problemas: estado.problemas, cambiadas: estado.cambiadas, escritas: estado.escritas })).run();
   return estado;
 }
 async function desdeLaUltima(db) {
@@ -498,7 +529,7 @@ var worker_default = {
       if (!llave || (request.headers.get("authorization") || "") !== `Bearer ${llave}`) {
         return json({ error: "no_autorizado" }, 401);
       }
-      return json(await espejar(env));
+      return json(await espejar(env, { forzar: true }));
     }
     if (url.pathname === "/espejo/estado") {
       if (!env.DB) return json({ error: "base_no_disponible" }, 503);

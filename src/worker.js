@@ -120,7 +120,7 @@ export default {
       if (!llave || (request.headers.get("authorization") || "") !== `Bearer ${llave}`) {
         return json({ error: "no_autorizado" }, 401);
       }
-      return json(await espejar(env));
+      return json(await espejar(env, { forzar: true }));
     }
     if (url.pathname === "/espejo/estado") {
       if (!env.DB) return json({ error: "base_no_disponible" }, 503);
