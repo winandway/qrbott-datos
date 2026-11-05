@@ -22,7 +22,7 @@
  */
 
 import { entrar, registrar, cambiarClave, leerSesion, buscarPorCorreo } from "./cuentas.js";
-import { espejar, desdeLaUltima, CADA_MS } from "./espejo.js";
+import { espejar, desdeLaUltima, CADA_MS, consumoDelEspejo } from "./espejo.js";
 import { consultar, insertar, actualizar, borrar, tiendasDe } from "./acceso.js";
 
 const SUPABASE_URL = "https://ekurbldypbygxfwbghik.supabase.co";
@@ -141,9 +141,11 @@ export default {
         db = "error: " + (e && e.message ? e.message : String(e));
       }
       const bucket = env.BUCKET ? "ok" : "sin binding";
-      const estado = db === "ok" && bucket === "ok" ? "ok" : "degradado";
+      // 5-11-2026: el consumo de escrituras de la base, para que un bucle caro se vea el mismo día.
+      const escrituras = env.DB ? await consumoDelEspejo(env.DB) : { color: "rojo", error: "sin base" };
+      const estado = db === "ok" && bucket === "ok" && escrituras.color === "verde" ? "ok" : "degradado";
       return json(
-        { servicio: "qrbott-datos", estado, db, bucket, hora: new Date().toISOString() },
+        { servicio: "qrbott-datos", estado, db, bucket, escrituras, hora: new Date().toISOString() },
         estado === "ok" ? 200 : 503
       );
     }

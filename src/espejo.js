@@ -71,6 +71,16 @@ const TOPE_SENTENCIA = 80000; // D1 admite 100 KB por sentencia
 const PAGINA = 1000;
 export const CADA_MS = 5 * 60 * 1000;
 
+/**
+ * PRESUPUESTO DE ESCRITURAS (5-11-2026, regla «LA NUBE NO SE COME EL DINERO»).
+ * Un día normal el espejo escribe unos cientos de filas. Si una vuelta quiere escribir más de esto, algo
+ * está mal (una tabla que cambia sola, una columna que no compara): la vuelta FRENA antes de escribir,
+ * queda en la bitácora como problema y el canario /datos/salud lo muestra en rojo.
+ */
+export const TOPE_ESCRITURAS_VUELTA = 20000;
+/** Tope de un día entero (todas las vueltas): por encima, el canario se pone rojo. */
+export const TOPE_ESCRITURAS_DIA = 200000;
+
 /** Un valor de Postgres como literal de SQLite. Comillas dobladas y sin bytes nulos. */
 function literal(v) {
   if (v === null || v === undefined) return 'NULL';
@@ -170,7 +180,7 @@ async function columnasDeTodas(db) {
   return mapa;
 }
 
-async function espejarTabla(env, clave, db, tabla, cols, padres) {
+async function espejarTabla(env, clave, db, tabla, cols, padres, presupuesto = { restante: Infinity }) {
   if (!cols?.length) return { tabla, saltada: true };
   const filas = await leerDeSupabase(env, clave, tabla);
   const h = HEREDA[tabla];
@@ -195,6 +205,11 @@ async function espejarTabla(env, clave, db, tabla, cols, padres) {
   const cambiadas = vivas.filter((f) => cambio(f, guardadas.get(comoTexto(f)), usadas));
 
   let escritas = 0;
+  // El presupuesto se mira ANTES de escribir: si no alcanza, esta tabla no se toca en esta vuelta.
+  if (cambiadas.length > presupuesto.restante) {
+    throw new Error(`tope_escrituras: ${tabla} quería escribir ${cambiadas.length} filas y quedaban ${presupuesto.restante}`);
+  }
+  presupuesto.restante -= cambiadas.length;
   if (cambiadas.length) {
     const stmts = sentenciasDeInsercion(tabla, usadas, cambiadas).map((s) => db.prepare(s));
     for (let i = 0; i < stmts.length; i += 10) escritas += escritasDe(await db.batch(stmts.slice(i, i + 10))); // cada lote, una transacción
@@ -238,7 +253,7 @@ export async function tomarTurno(db, forzar = false) {
 }
 
 /** Copia TODAS las familias de una pasada. Aquí caben: la base es un enlace, no una llamada. */
-export async function espejar(env, { forzar = false } = {}) {
+export async function espejar(env, { forzar = false, tope = TOPE_ESCRITURAS_VUELTA } = {}) {
   const t0 = Date.now();
   const db = env.DB;
   if (!(await tomarTurno(db, forzar))) return { ok: true, saltada: true, motivo: 'otra vuelta tiene el turno', hora: new Date().toISOString() };
@@ -250,10 +265,11 @@ export async function espejar(env, { forzar = false } = {}) {
   const columnas = await columnasDeTodas(db);
   const padres = {};
   const resumen = [];
+  const presupuesto = { restante: tope };
   for (const tablas of Object.values(FAMILIAS)) {
     for (const t of tablas) {
       try {
-        const r = await espejarTabla(env, clave, db, t, columnas[t], padres);
+        const r = await espejarTabla(env, clave, db, t, columnas[t], padres, presupuesto);
         resumen.push(r);
         if (t === 'documentos_comerciales' || t === 'pos_registers') {
           padres[t] = new Map((r.filasLeidas || []).map((f) => [f.id, f.bot_id]));
@@ -275,10 +291,11 @@ export async function espejar(env, { forzar = false } = {}) {
     tablas: resumen.length,
     ok: mal.length === 0,
     problemas: mal.map((m) => `${m.tabla}: ${m.error ?? `${m.esperadas}→${m.destino}`}`),
+    frenada: mal.some((m) => String(m.error || '').startsWith('Error: tope_escrituras')),
   };
   await db
     .prepare('INSERT OR REPLACE INTO _espejo (hora, familia, ok, filas, segundos, detalle) VALUES (?, ?, ?, ?, ?, ?)')
-    .bind(estado.hora, estado.familia, estado.ok ? 1 : 0, estado.filas, estado.segundos, JSON.stringify({ problemas: estado.problemas, cambiadas: estado.cambiadas, escritas: estado.escritas }))
+    .bind(estado.hora, estado.familia, estado.ok ? 1 : 0, estado.filas, estado.segundos, JSON.stringify({ problemas: estado.problemas, cambiadas: estado.cambiadas, escritas: estado.escritas, frenada: estado.frenada }))
     .run();
   return estado;
 }
@@ -290,5 +307,25 @@ export async function desdeLaUltima(db) {
     return r?.hora ? Date.now() - Date.parse(r.hora) : Infinity;
   } catch {
     return Infinity; // aún no existe la tabla: hay que copiar
+  }
+}
+
+/**
+ * Lo que el canario /datos/salud cuenta del espejo: filas escritas en las últimas 24 h (de la bitácora) y
+ * si alguna vuelta frenó por el tope. Verde, amarillo (frenó una vuelta) o rojo (pasó el tope del día).
+ */
+export async function consumoDelEspejo(db) {
+  try {
+    const desde = new Date(Date.now() - 86400_000).toISOString();
+    const r = await db
+      .prepare("SELECT count(*) AS vueltas, coalesce(sum(json_extract(detalle, '$.escritas')), 0) AS escritas, coalesce(sum(CASE WHEN json_extract(detalle, '$.frenada') THEN 1 ELSE 0 END), 0) AS frenadas FROM _espejo WHERE hora >= ?")
+      .bind(desde)
+      .first();
+    const escritas = Number(r?.escritas || 0);
+    const frenadas = Number(r?.frenadas || 0);
+    const color = escritas > TOPE_ESCRITURAS_DIA ? 'rojo' : frenadas > 0 ? 'amarillo' : 'verde';
+    return { color, vueltas_24h: Number(r?.vueltas || 0), escritas_24h: escritas, vueltas_frenadas_24h: frenadas, tope_dia: TOPE_ESCRITURAS_DIA, tope_vuelta: TOPE_ESCRITURAS_VUELTA };
+  } catch (e) {
+    return { color: 'rojo', error: `no se pudo medir: ${String(e).slice(0, 120)}` }; // nunca «verde» si no se pudo medir
   }
 }

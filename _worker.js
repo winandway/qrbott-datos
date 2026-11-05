@@ -182,6 +182,8 @@ var HEREDA = {
 var TOPE_SENTENCIA = 8e4;
 var PAGINA = 1e3;
 var CADA_MS = 5 * 60 * 1e3;
+var TOPE_ESCRITURAS_VUELTA = 2e4;
+var TOPE_ESCRITURAS_DIA = 2e5;
 function literal(v) {
   if (v === null || v === void 0) return "NULL";
   if (typeof v === "number") return Number.isFinite(v) ? String(v) : "NULL";
@@ -248,7 +250,7 @@ async function columnasDeTodas(db) {
   }
   return mapa;
 }
-async function espejarTabla(env, clave, db, tabla, cols, padres) {
+async function espejarTabla(env, clave, db, tabla, cols, padres, presupuesto = { restante: Infinity }) {
   if (!cols?.length) return { tabla, saltada: true };
   const filas = await leerDeSupabase(env, clave, tabla);
   const h = HEREDA[tabla];
@@ -271,6 +273,10 @@ async function espejarTabla(env, clave, db, tabla, cols, padres) {
   const guardadas = new Map((antes || []).map((f) => [comoTexto(f), f]));
   const cambiadas = vivas.filter((f) => cambio(f, guardadas.get(comoTexto(f)), usadas));
   let escritas = 0;
+  if (cambiadas.length > presupuesto.restante) {
+    throw new Error(`tope_escrituras: ${tabla} quer\xEDa escribir ${cambiadas.length} filas y quedaban ${presupuesto.restante}`);
+  }
+  presupuesto.restante -= cambiadas.length;
   if (cambiadas.length) {
     const stmts = sentenciasDeInsercion(tabla, usadas, cambiadas).map((s) => db.prepare(s));
     for (let i = 0; i < stmts.length; i += 10) escritas += escritasDe(await db.batch(stmts.slice(i, i + 10)));
@@ -300,7 +306,7 @@ async function tomarTurno(db, forzar = false) {
   const r = await db.prepare("INSERT INTO _espejo_turno (id, hora) VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET hora = excluded.hora WHERE _espejo_turno.hora <= ?").bind(ahora, ahora - CADA_MS).run();
   return (r?.meta?.changes ?? r?.meta?.rows_written ?? 0) > 0;
 }
-async function espejar(env, { forzar = false } = {}) {
+async function espejar(env, { forzar = false, tope = TOPE_ESCRITURAS_VUELTA } = {}) {
   const t0 = Date.now();
   const db = env.DB;
   if (!await tomarTurno(db, forzar)) return { ok: true, saltada: true, motivo: "otra vuelta tiene el turno", hora: (/* @__PURE__ */ new Date()).toISOString() };
@@ -310,10 +316,11 @@ async function espejar(env, { forzar = false } = {}) {
   const columnas = await columnasDeTodas(db);
   const padres = {};
   const resumen = [];
+  const presupuesto = { restante: tope };
   for (const tablas of Object.values(FAMILIAS)) {
     for (const t of tablas) {
       try {
-        const r = await espejarTabla(env, clave, db, t, columnas[t], padres);
+        const r = await espejarTabla(env, clave, db, t, columnas[t], padres, presupuesto);
         resumen.push(r);
         if (t === "documentos_comerciales" || t === "pos_registers") {
           padres[t] = new Map((r.filasLeidas || []).map((f) => [f.id, f.bot_id]));
@@ -333,9 +340,10 @@ async function espejar(env, { forzar = false } = {}) {
     escritas: resumen.reduce((a, r) => a + (r.escritas || 0), 0),
     tablas: resumen.length,
     ok: mal.length === 0,
-    problemas: mal.map((m) => `${m.tabla}: ${m.error ?? `${m.esperadas}\u2192${m.destino}`}`)
+    problemas: mal.map((m) => `${m.tabla}: ${m.error ?? `${m.esperadas}\u2192${m.destino}`}`),
+    frenada: mal.some((m) => String(m.error || "").startsWith("Error: tope_escrituras"))
   };
-  await db.prepare("INSERT OR REPLACE INTO _espejo (hora, familia, ok, filas, segundos, detalle) VALUES (?, ?, ?, ?, ?, ?)").bind(estado.hora, estado.familia, estado.ok ? 1 : 0, estado.filas, estado.segundos, JSON.stringify({ problemas: estado.problemas, cambiadas: estado.cambiadas, escritas: estado.escritas })).run();
+  await db.prepare("INSERT OR REPLACE INTO _espejo (hora, familia, ok, filas, segundos, detalle) VALUES (?, ?, ?, ?, ?, ?)").bind(estado.hora, estado.familia, estado.ok ? 1 : 0, estado.filas, estado.segundos, JSON.stringify({ problemas: estado.problemas, cambiadas: estado.cambiadas, escritas: estado.escritas, frenada: estado.frenada })).run();
   return estado;
 }
 async function desdeLaUltima(db) {
@@ -344,6 +352,18 @@ async function desdeLaUltima(db) {
     return r?.hora ? Date.now() - Date.parse(r.hora) : Infinity;
   } catch {
     return Infinity;
+  }
+}
+async function consumoDelEspejo(db) {
+  try {
+    const desde = new Date(Date.now() - 864e5).toISOString();
+    const r = await db.prepare("SELECT count(*) AS vueltas, coalesce(sum(json_extract(detalle, '$.escritas')), 0) AS escritas, coalesce(sum(CASE WHEN json_extract(detalle, '$.frenada') THEN 1 ELSE 0 END), 0) AS frenadas FROM _espejo WHERE hora >= ?").bind(desde).first();
+    const escritas = Number(r?.escritas || 0);
+    const frenadas = Number(r?.frenadas || 0);
+    const color = escritas > TOPE_ESCRITURAS_DIA ? "rojo" : frenadas > 0 ? "amarillo" : "verde";
+    return { color, vueltas_24h: Number(r?.vueltas || 0), escritas_24h: escritas, vueltas_frenadas_24h: frenadas, tope_dia: TOPE_ESCRITURAS_DIA, tope_vuelta: TOPE_ESCRITURAS_VUELTA };
+  } catch (e) {
+    return { color: "rojo", error: `no se pudo medir: ${String(e).slice(0, 120)}` };
   }
 }
 
@@ -547,9 +567,10 @@ var worker_default = {
         db = "error: " + (e && e.message ? e.message : String(e));
       }
       const bucket = env.BUCKET ? "ok" : "sin binding";
-      const estado = db === "ok" && bucket === "ok" ? "ok" : "degradado";
+      const escrituras = env.DB ? await consumoDelEspejo(env.DB) : { color: "rojo", error: "sin base" };
+      const estado = db === "ok" && bucket === "ok" && escrituras.color === "verde" ? "ok" : "degradado";
       return json(
-        { servicio: "qrbott-datos", estado, db, bucket, hora: (/* @__PURE__ */ new Date()).toISOString() },
+        { servicio: "qrbott-datos", estado, db, bucket, escrituras, hora: (/* @__PURE__ */ new Date()).toISOString() },
         estado === "ok" ? 200 : 503
       );
     }

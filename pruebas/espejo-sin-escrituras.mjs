@@ -111,5 +111,19 @@ sqlite.exec(`UPDATE _espejo_turno SET hora = ${Date.now() - CADA_MS - 1000}`);
 const v6 = await espejar(env);
 ok(!v6.saltada && v6.escritas === 0, '5. pasados 5 minutos la siguiente vuelta toma el turno (y sigue sin escribir nada)');
 
+// 6. El presupuesto: una vuelta que quiere escribir de más FRENA antes de escribir (regla «la nube no se come el dinero»).
+for (const v of datos.pos_sales) v.total += 1; // 119 ventas cambian de golpe
+sqlite.exec(`UPDATE _espejo_turno SET hora = 0`);
+const c6 = totalCambios();
+const v7 = await espejar(env, { forzar: true, tope: 50 });
+const escritasTope = totalCambios() - c6;
+ok(v7.frenada === true && v7.escritas === 0, `6. con tope de 50 y 119 cambios, la vuelta frena sin escribir (espejo ${v7.escritas}, frenada ${v7.frenada})`);
+ok(escritasTope <= 2, `6. SQLite no contó escrituras de ventas (solo turno y bitácora: ${escritasTope})`);
+ok((v7.problemas || []).some((p) => /tope_escrituras/.test(p)), '6. el problema queda anotado en la bitácora');
+const consumo = await espejo.consumoDelEspejo(DB);
+ok(consumo.color === 'amarillo' && consumo.vueltas_frenadas_24h >= 1, `6. el canario lo muestra (${consumo.color}, ${consumo.vueltas_frenadas_24h} frenadas)`);
+const v8 = await espejar(env, { forzar: true });
+ok(!v8.frenada && v8.cambiadas === 119, '6. con el tope normal, la vuelta siguiente sí copia los cambios');
+
 console.log(fallos.length ? `\nFALLÓ (${fallos.length}):\n - ${fallos.join('\n - ')}\n` : '\nTODO EN VERDE: el espejo solo escribe lo que cambió, y una sola vuelta a la vez.\n');
 process.exit(fallos.length ? 1 : 0);
